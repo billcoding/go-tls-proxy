@@ -1,0 +1,126 @@
+# 对外提供 HTTPS，并把连接反向代理到一个或多个 TCP 地址。
+#
+# 证书向 Let's Encrypt 申请，使用者是 IP，不是域名。
+# IP 证书固定为 shortlived，有效期约 160 小时（6 天多）。
+# 程序默认每 72 小时重新申请一次；若证书会在下次更新前过期，会提前更新。
+#
+# 申请方式固定为 http-01：只在申请和续期的几分钟内监听 80 端口，结束后关闭。
+# 这些 IP 的 80 端口必须能从公网访问到本机。申请进程会临时放行本机防火墙，校验结束后删除。
+# 云厂商安全组要在控制台放行，程序和部署脚本都改不了安全组。
+# 若 80 已被 nginx 占用，且本机已有 /var/www/go-tls-proxy/.well-known/acme-challenge，校验文件会写到那里。
+#
+# 证书 IP 自动取本机当前公网地址，能查到 IPv6 时一并放入。
+# 环境变量 GO_TLS_PROXY_PUBLIC_IP 会覆盖这次自动查询。
+# 一张证书最多 25 个 IP，并且每个 IP 都要能被 Let's Encrypt 访问到。
+# 账户邮箱不写在配置里。程序生成 8 位@8 位.com 的随机邮箱，写到证书目录的 account.email，之后续期继续用同一个。
+
+certificate:
+  renew_every: 72h
+  storage_dir: data
+
+# 可选。只有某个 backend 写成 docker://容器名:端口 时，程序才会连接 Docker。
+# 端口是容器内部服务监听的端口，不是宿主机映射出来的端口。
+# socket 默认是本机 Docker Engine 套接字。
+# 容器 IP 取该容器第一个有地址的网络。
+# 容器必须正在运行。容器重启后 IP 会变：HTTP 每次转发都按容器名查询（成功结果缓存约 2 秒），TCP 每次新连接都查询。
+# 连不上该地址（拒绝连接、没有路由、超时）时会丢掉缓存再查一次。已经建立的长连接不会跟着换地址。
+# 使用容器名时，运行用户要能读这个套接字。systemd 以系统用户 go-tls-proxy 运行，配置含 docker:// 时由 deploy.sh 加入 docker 组。
+docker:
+  socket: unix:///var/run/docker.sock
+
+proxies:
+  # mode: http 默认做 TLS，客户端用 HTTPS。只有写 tls: false 才按明文 HTTP 监听。
+  # 同一端口可以一条明文加一条 HTTPS，见下面的重定向说明。两条都明文或都 HTTPS 会冲突。
+  # tcp 模式始终是 TLS，写了 tls 也不会变成明文。
+  # 同一个端口按路径转到不同后端。后端要写 host:port。
+  - name: web
+    listen: ":443"
+    mode: http
+    routes:
+      - path: /api
+        backend: 127.0.0.1:8081
+      - path: /
+        backend: 127.0.0.1:8080
+
+  # 重定向写在 http 模式的 routes 里，字段只有 redirect 和 redirect_code。
+  # 不能写在代理顶层，tcp 模式也不能用（tcp 不能写 routes）。
+  # 明文（tls: false）和 HTTPS 都能配。没有单独的「强制跳 HTTPS」开关。
+  # 80 端口留给证书校验，不要拿来做业务跳转。
+  # 同一条 route 只能写 backend 或 redirect 其中一个，重定向不需要 backend。
+  # 同一个代理里可以混用：有的 path 跳转，有的 path 转发。
+  # redirect_code 只能是 301（永久）或 302（临时），不写则是 302。不支持 307、308。
+  # 只写了 redirect_code、没写 redirect 会报错。
+  # path 按前缀匹配，更长的 path 优先。拼接时用完整请求路径，不会去掉这段前缀。
+  #
+  # redirect 有两种写法。
+  # 1. 带主机的完整 http 或 https 地址。相对路径和其他协议会报错。
+  #    协议、主机、端口都用目标里的，不再保留客户端原来的 Host。
+  #    目标以 / 结尾，或只写了主机时，接上原请求路径，并保留查询串。请求路径是 / 时不再多加一段：
+  #      https://203.0.113.10/      收到 /a/b?x=1  →  https://203.0.113.10/a/b?x=1
+  #      https://203.0.113.10       同样接上原路径。
+  #      路由 path 为 /old、目标为 https://203.0.113.10/ 时，收到 /old/a/b?x=1
+  #        →  https://203.0.113.10/old/a/b?x=1
+  #      https://203.0.113.10/app/  收到 /a/b?x=1  →  https://203.0.113.10/app/a/b?x=1
+  #    目标已经写了具体路径（不以 / 结尾）时，跳到这个路径，不再接原路径；原查询串仍保留。
+  #    目标自己有查询串时放在前面，原查询串用 & 接在后面：
+  #      https://203.0.113.10/landing             收到 /a/b?x=1  →  https://203.0.113.10/landing?x=1
+  #      https://203.0.113.10/landing?from=old    收到 /a/b?x=1  →  https://203.0.113.10/landing?from=old&x=1
+  # 2. 另一个 http 代理的 name。这是发给客户端的重定向，不是内部反向代理。
+  #    找不到、指向自己、指向 tcp，或代理重名时，加载配置直接报错。
+  #    协议看目标：省略 tls 或 tls: true 是 https，tls: false 是 http。
+  #    主机用请求的 Host，去掉原来的端口，再换上目标的 listen 端口。
+  #    Host 为空时用证书上的公网地址。目标没有额外路径，路径和查询串与上面只写主机时相同。
+  #    不同端口也可以按名字跳。
+  #
+  # 同一个监听地址可以同时有一条 tls: false 和一条 HTTPS（省略 tls 或 tls: true）的 http 代理。
+  # 两条共用一个套接字：开头是 TLS ClientHello 交给 HTTPS，否则按明文 HTTP 交给 tls: false。
+  # 两条都是 HTTPS，或两条都是明文，仍然报端口冲突。
+  # - name: app-http
+  #   listen: ":9001"
+  #   mode: http
+  #   tls: false
+  #   routes:
+  #     - path: /
+  #       redirect: app
+  # - name: app
+  #   listen: ":9001"
+  #   mode: http
+  #   backend: 127.0.0.1:9001
+  # - name: app-alt
+  #   listen: ":9080"
+  #   mode: http
+  #   tls: false
+  #   routes:
+  #     - path: /old
+  #       redirect: https://203.0.113.10/
+  #       redirect_code: 301
+  #     - path: /
+  #       redirect: app
+  #       redirect_code: 302
+
+  # 也可以不写 IP 或宿主机端口，直接写正在运行的容器名。HTTP 和 TCP 都支持。
+  # 只写一个后端时：
+  # - name: app
+  #   listen: ":443"
+  #   mode: http
+  #   backend: docker://web:80
+  # 按路径转发时只写 routes，不要再写 backend：
+  # - name: app
+  #   listen: ":443"
+  #   mode: http
+  #   routes:
+  #     - path: /api
+  #       backend: docker://api:8080
+  #     - path: /
+  #       backend: docker://web:80
+  # TCP 同样使用容器内部端口：
+  # - name: db
+  #   listen: ":8443"
+  #   mode: tcp
+  #   backend: docker://postgres:5432
+
+  # 外部仍是 TLS。握手完成后按原始字节流转发，适合非 HTTP 服务。
+  - name: extra
+    listen: ":8443"
+    mode: tcp
+    backend: 127.0.0.1:9000

@@ -1,0 +1,39 @@
+[Unit]
+Description=go-tls-proxy TLS 反向代理
+After=network-online.target docker.service
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+# 使用 docker://容器名 作为后端时，运行用户要能读 /var/run/docker.sock。
+# 把用户加入 docker 组即可：usermod -aG docker go-tls-proxy
+# deploy.sh 会在配置含 docker:// 时自动加入。未使用容器名时不必加入，也不必安装 Docker。
+# 服务以系统用户 go-tls-proxy 运行。
+# After=docker.service 只调整启动顺序，没有 Requires=，机器上没有 Docker 时服务仍会启动。
+
+[Service]
+Type=simple
+User=go-tls-proxy
+Group=go-tls-proxy
+ExecStart=/data/opt/go-tls-proxy/go-tls-proxy -config /data/opt/go-tls-proxy/go-tls-proxy.yml
+WorkingDirectory=/data/opt/go-tls-proxy
+EnvironmentFile=-/data/opt/go-tls-proxy/go-tls-proxy.env
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65535
+# http-01 申请时短暂监听 80，并临时改防火墙。这两个能力只加在本进程上：
+# CAP_NET_BIND_SERVICE 绑定 80，CAP_NET_ADMIN 直接改 iptables/nft。
+# firewalld 和 ufw 不认这些能力，改由 sudo 执行本程序的 fw80 open / fw80 close。
+# sudoers 只放行这两个子命令。
+# AmbientCapabilities 会让 systemd 默认打开 NoNewPrivileges。Ubuntu 的 sudo-rs
+# 在 NoNewPrivileges 或被收窄的 CapabilityBoundingSet 里会 panic：
+# could not restore to saved user id: Operation not permitted。
+# 所以这里显式关掉 NoNewPrivileges，也不收紧 CapabilityBoundingSet。
+NoNewPrivileges=no
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=go-tls-proxy
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

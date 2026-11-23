@@ -29,6 +29,20 @@ go.work.sum
 # env file
 .env
 
-# Editor/IDE
-# .idea/
-# .vscode/
+# 编辑器 / IDE
+.idea/
+.vscode/
+.cursor/
+dist/
+
+# macOS
+.DS_Store
+._*
+__MACOSX/
+
+config/go-tls-proxy.yml
+
+# 证书、账户密钥和私钥
+*.pem
+*.key
+*.crt
